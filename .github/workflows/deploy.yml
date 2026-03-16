@@ -1,0 +1,87 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  # Позволяет запускать workflow вручную из вкладки Actions
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # Формат: username/repository-name (автоматически подставляется GitHub)
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    
+    steps:
+      - name: Execute remote ssh commands to deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          # port: ${{ secrets.SERVER_PORT }} # Раскомментируйте, если SSH порт отличный от 22
+          script: |
+            # Логинимся в GitHub Container Registry на сервере
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
+            # Останавливаем и удаляем старый контейнер, если он работает
+            docker stop time-server || true
+            docker rm time-server || true
+            
+            # Удаляем старый образ перед скачиванием нового, чтобы точно получить свежую версию
+            docker rmi ghcr.io/${{ github.repository }}:latest || true
+            
+            # Скачиваем новую версию образа (тег latest)
+            docker pull ghcr.io/${{ github.repository }}:latest
+            
+            # Запускаем новый контейнер
+            docker run -d \
+              --name time-server \
+              -p 8001:8000 \
+              --restart unless-stopped \
+              ghcr.io/${{ github.repository }}:latest
+              
+            # Показываем статус запущенного контейнера (полезно для логов GitHub Actions)
+            docker ps -a | grep time-server
+            
+            # Очищаем неиспользуемые (dangling) образы, чтобы не забивать память сервера
+            docker image prune -f
